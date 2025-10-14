@@ -1,15 +1,12 @@
 package propher
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"propher/internal/config"
-	"strings"
+	"strconv"
 	"time"
 )
 
@@ -42,111 +39,132 @@ func realMain() int {
 	return 0
 }
 
-func run(ctx context.Context, cfg *Config) error {
-	if cfg.Debug {
-		fmt.Fprintf(os.Stderr, "debug: base_url=%s\n", cfg.BaseURL)
-	}
-
-	// пример работы
-	select {
-	case <-time.After(300 * time.Millisecond):
-		fmt.Fprintln(os.Stdout, "ok")
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// loadDotEnv читает .env и выставляет переменные окружения.
-// override=false: НЕ перетирать уже заданные переменные в окружении.
-// override=true: перетирать (обычно не надо).
-func loadDotEnv(path string, override bool) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	lineNo := 0
-
-	for sc.Scan() {
-		lineNo++
-		line := strings.TrimSpace(sc.Text())
-
-		// пустые строки и комментарии
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		// допускаем: export KEY=VALUE
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
-		}
-
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			return fmt.Errorf("%s:%d: invalid line (expected KEY=VALUE)", path, lineNo)
-		}
-		key = strings.TrimSpace(key)
-		val = strings.TrimSpace(val)
-
-		if key == "" {
-			return fmt.Errorf("%s:%d: empty key", path, lineNo)
-		}
-
-		// убираем кавычки "..." или '...'
-		val = unquoteEnv(val)
-
-		if !override {
-			if _, exists := os.LookupEnv(key); exists {
-				continue
-			}
-		}
-
-		if err := os.Setenv(key, val); err != nil {
-			return fmt.Errorf("%s:%d: setenv(%s): %w", path, lineNo, key, err)
-		}
-	}
-
-	if err := sc.Err(); err != nil {
-		return err
-	}
-
+// run is placeholder
+func run(ctx context.Context, cfg *config.Config) error {
 	return nil
 }
 
-func unquoteEnv(v string) string {
-	if len(v) >= 2 {
-		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
-			return v[1 : len(v)-1]
-		}
+func parseConfig() (*config.Config, error) {
+	// Load .env-backed config first, then override with CLI flags (if set).
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
 	}
-	return v
+
+	// Use custom flag types to track whether a flag was explicitly set.
+	baseURL := stringFlag{value: cfg.BaseURL}
+	debug := boolFlag{value: cfg.Debug}
+	timeout := durationFlag{value: cfg.Timeout}
+	queue := stringFlag{value: cfg.QueueName}
+	redisURL := stringFlag{value: cfg.Redis.URL}
+	redisAddr := stringFlag{value: cfg.Redis.Addr}
+	redisPass := stringFlag{value: cfg.Redis.Pass}
+	redisDB := intFlag{value: cfg.Redis.DB}
+
+	flag.Var(&baseURL, "base-url", "Base URL")
+	flag.Var(&debug, "debug", "Enable debug logging")
+	flag.Var(&timeout, "timeout", "Timeout duration (e.g. 5s, 1m)")
+	flag.Var(&queue, "queue", "Queue name")
+	flag.Var(&redisURL, "redis-url", "Redis URL")
+	flag.Var(&redisAddr, "redis-addr", "Redis address")
+	flag.Var(&redisPass, "redis-pass", "Redis password")
+	flag.Var(&redisDB, "redis-db", "Redis database number")
+	flag.Parse()
+
+	// Apply overrides only for flags that were passed.
+	applyIfSet(baseURL.set, func() { cfg.BaseURL = baseURL.value })
+	applyIfSet(debug.set, func() { cfg.Debug = debug.value })
+	applyIfSet(timeout.set, func() { cfg.Timeout = timeout.value })
+	applyIfSet(queue.set, func() { cfg.QueueName = queue.value })
+
+	// Redis URL wins if set; otherwise allow fine-grained overrides.
+	if redisURL.set {
+		cfg.Redis.URL = redisURL.value
+	} else if redisAddr.set || redisPass.set || redisDB.set {
+		cfg.Redis.URL = ""
+	}
+
+	applyIfSet(redisAddr.set, func() { cfg.Redis.Addr = redisAddr.value })
+	applyIfSet(redisPass.set, func() { cfg.Redis.Pass = redisPass.value })
+	applyIfSet(redisDB.set, func() { cfg.Redis.DB = redisDB.value })
+
+	return cfg, nil
 }
 
-func getenvDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func applyIfSet(set bool, apply func()) {
+	if set {
+		apply()
 	}
-	return def
 }
 
-func expandPath(p string) (string, error) {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return "", errors.New("empty path")
+type stringFlag struct {
+	value string
+	set   bool
+}
+
+func (f *stringFlag) String() string {
+	return f.value
+}
+
+func (f *stringFlag) Set(value string) error {
+	f.value = value
+	f.set = true
+	return nil
+}
+
+type boolFlag struct {
+	value bool
+	set   bool
+}
+
+func (f *boolFlag) String() string {
+	return strconv.FormatBool(f.value)
+}
+
+func (f *boolFlag) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return err
 	}
-	if strings.HasPrefix(p, "~") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		if p == "~" {
-			p = home
-		} else if strings.HasPrefix(p, "~/") {
-			p = filepath.Join(home, p[2:])
-		}
+	f.value = parsed
+	f.set = true
+	return nil
+}
+
+type intFlag struct {
+	value int
+	set   bool
+}
+
+func (f *intFlag) String() string {
+	return strconv.Itoa(f.value)
+}
+
+func (f *intFlag) Set(value string) error {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return err
 	}
-	return filepath.Clean(p), nil
+	f.value = parsed
+	f.set = true
+	return nil
+}
+
+type durationFlag struct {
+	value time.Duration
+	set   bool
+}
+
+func (f *durationFlag) String() string {
+	return f.value.String()
+}
+
+func (f *durationFlag) Set(value string) error {
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return err
+	}
+	f.value = parsed
+	f.set = true
+	return nil
 }
