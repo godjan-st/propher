@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"math"
 	"os"
 	"propher/internal"
+	"propher/internal/config"
 	"sort"
 	"strings"
 	"time"
@@ -17,17 +17,26 @@ import (
 )
 
 type Record struct {
-	TSms      int64  `json:"ts_ms"`
-	ObsQueue  string `json:"obs_queue"`
+	// TSms - время измерения в миллисекундах.
+	TSms int64 `json:"ts_ms"`
+	// ObsQueue - исходная очередь.
+	ObsQueue string `json:"obs_queue"`
+	// HoldQueue - очередь удержания.
 	HoldQueue string `json:"hold_queue"`
-	OK        bool   `json:"ok"`
-	Error     string `json:"error,omitempty"`
-	TraceID   string `json:"trace_id,omitempty"`
-	T0ms      *int64 `json:"t0_ms,omitempty"`
+	// OK - признак успешной обработки.
+	OK bool `json:"ok"`
+	// Error - описание ошибки (если есть).
+	Error string `json:"error,omitempty"`
+	// TraceID - идентификатор трассировки.
+	TraceID string `json:"trace_id,omitempty"`
+	// T0ms - исходный timestamp.
+	T0ms *int64 `json:"t0_ms,omitempty"`
+	// LatencyMS - задержка в миллисекундах.
 	LatencyMS *int64 `json:"latency_ms,omitempty"`
 }
 
 func percentile(sortedVals []int64, q float64) int64 {
+	// Возвращаем персентиль в отсортированном массиве.
 	n := len(sortedVals)
 	if n == 0 {
 		return 0
@@ -43,6 +52,7 @@ func percentile(sortedVals []int64, q float64) int64 {
 }
 
 func extractInt64(v any, unit string) (*int64, error) {
+	// Преобразуем число или строку в миллисекунды.
 	// Accept numbers (json decodes as float64) and numeric strings.
 	switch t := v.(type) {
 	case float64:
@@ -79,53 +89,36 @@ func extractInt64(v any, unit string) (*int64, error) {
 	}
 }
 
-func main() {
-	var (
-		redisAddr     = flag.String("redis-addr", "127.0.0.1:6379", "Redis address host:port")
-		redisPass     = flag.String("redis-pass", "", "Redis password")
-		redisDB       = flag.Int("redis-db", 0, "Redis DB number")
-		obsQueue      = flag.String("obs-queue", "", "Observed LIST key (required)")
-		holdQueue     = flag.String("hold-queue", "", "Hold LIST key (default: <obs-queue>:hold)")
-		durationSec   = flag.Int("duration-sec", 600, "How long to measure (seconds)")
-		blockSec      = flag.Int("block-sec", 1, "BRPOPLPUSH timeout (seconds)")
-		maxMessages   = flag.Int("max-messages", 0, "Stop after N messages (0 = unlimited)")
-		outJSONL      = flag.String("out-jsonl", "latency.jsonl", "Output JSONL path")
-		t0Field       = flag.String("t0-field", "sent_epoch", "Field containing t0")
-		t0Unit        = flag.String("t0-unit", "ms", "Unit for t0: ms or s")
-		traceField    = flag.String("trace-field", "trace_id", "Field containing trace id")
-		restore       = flag.Bool("restore", false, "Restore messages from hold back to obs after measurement")
-		restoreVerify = flag.Bool("restore-verify-empty", false, "Refuse restore if obs-queue is non-empty at restore time")
-	)
-	flag.Parse()
-
-	if *obsQueue == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: --obs-queue is required")
-		os.Exit(2)
+func RunMeasureListLatency(cfg *config.Config) error {
+	// Измеряем задержку сообщений в очереди Redis.
+	measureCfg := cfg.MeasureListLatency
+	if measureCfg.ObsQueue == "" {
+		return fmt.Errorf("obs-queue is required")
 	}
-	if *t0Unit != "ms" && *t0Unit != "s" {
-		fmt.Fprintln(os.Stderr, "ERROR: --t0-unit must be ms or s")
-		os.Exit(2)
+	if measureCfg.T0Unit != "ms" && measureCfg.T0Unit != "s" {
+		return fmt.Errorf("t0-unit must be ms or s")
 	}
 
-	hq := *holdQueue
+	hq := measureCfg.HoldQueue
 	if hq == "" {
-		hq = *obsQueue + ":hold"
+		hq = measureCfg.ObsQueue + ":hold"
 	}
 
+	// Подключение к Redis.
 	ctx := context.Background()
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     *redisAddr,
-		Password: *redisPass,
-		DB:       *redisDB,
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Pass,
+		DB:       cfg.Redis.DB,
 	})
 
 	startMS := internal.NowMS()
-	endMS := startMS + int64(*durationSec)*1000
+	endMS := startMS + int64(measureCfg.DurationSec)*1000
 
-	f, err := os.Create(*outJSONL)
+	// Файл для записи результатов.
+	f, err := os.Create(measureCfg.OutJSONL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: create out file: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create out file: %w", err)
 	}
 	defer f.Close()
 
@@ -139,22 +132,22 @@ func main() {
 		badCount  int
 	)
 
+	// Основной цикл измерений.
 	for {
 		if internal.NowMS() >= endMS {
 			break
 		}
-		if *maxMessages > 0 && total >= *maxMessages {
+		if measureCfg.MaxMessages > 0 && total >= measureCfg.MaxMessages {
 			break
 		}
 
 		// Atomic move obs -> hold
-		raw, err := rdb.BRPopLPush(ctx, *obsQueue, hq, time.Duration(*blockSec)*time.Second).Result()
+		raw, err := rdb.BRPopLPush(ctx, measureCfg.ObsQueue, hq, time.Duration(measureCfg.BlockSec)*time.Second).Result()
 		if err != nil {
 			if err == redis.Nil {
 				continue // timeout, queue empty
 			}
-			fmt.Fprintf(os.Stderr, "ERROR: BRPOPLPUSH: %v\n", err)
-			break
+			return fmt.Errorf("brpoplpush: %w", err)
 		}
 
 		total++
@@ -162,11 +155,12 @@ func main() {
 
 		rec := Record{
 			TSms:      ts,
-			ObsQueue:  *obsQueue,
+			ObsQueue:  measureCfg.ObsQueue,
 			HoldQueue: hq,
 			OK:        false,
 		}
 
+		// Парсим JSON объект.
 		// Parse JSON object
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
@@ -179,14 +173,14 @@ func main() {
 		}
 
 		// trace_id
-		if v, ok := obj[*traceField]; ok && v != nil {
+		if v, ok := obj[measureCfg.TraceField]; ok && v != nil {
 			rec.TraceID = fmt.Sprintf("%v", v)
 		}
 
 		// t0
 		var t0ms *int64
-		if v, ok := obj[*t0Field]; ok && v != nil {
-			x, e := extractInt64(v, *t0Unit)
+		if v, ok := obj[measureCfg.T0Field]; ok && v != nil {
+			x, e := extractInt64(v, measureCfg.T0Unit)
 			if e == nil {
 				t0ms = x
 			}
@@ -194,7 +188,7 @@ func main() {
 		rec.T0ms = t0ms
 		if t0ms == nil {
 			badCount++
-			rec.Error = "missing_or_bad_" + *t0Field
+			rec.Error = "missing_or_bad_" + measureCfg.T0Field
 			b, _ := json.Marshal(rec)
 			w.Write(b)
 			w.WriteByte('\n')
@@ -216,6 +210,7 @@ func main() {
 	if durS <= 0 {
 		durS = 1e-9
 	}
+	// Итоговая статистика.
 	throughput := float64(okCount) / durS
 	fmt.Printf("[RESULT] total_read=%d ok=%d bad=%d duration_s=%.3f ok_throughput_msg_s=%.3f\n",
 		total, okCount, badCount, durS, throughput)
@@ -229,34 +224,33 @@ func main() {
 		fmt.Printf("[LAT] max=%d ms\n", latencies[len(latencies)-1])
 	}
 
-	if *restore {
-		if *restoreVerify {
-			cur, err := rdb.LLen(ctx, *obsQueue).Result()
+	// Опциональное восстановление сообщений.
+	if measureCfg.Restore {
+		if measureCfg.RestoreVerify {
+			cur, err := rdb.LLen(ctx, measureCfg.ObsQueue).Result()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: LLEN verify: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("llen verify: %w", err)
 			}
 			if cur != 0 {
-				fmt.Fprintf(os.Stderr, "Refuse restore: obs-queue %q is not empty (LLEN=%d)\n", *obsQueue, cur)
-				os.Exit(2)
+				return fmt.Errorf("refuse restore: obs-queue %q is not empty (LLEN=%d)", measureCfg.ObsQueue, cur)
 			}
 		}
 
 		moved := 0
 		for {
-			x, err := rdb.RPopLPush(ctx, hq, *obsQueue).Result()
+			x, err := rdb.RPopLPush(ctx, hq, measureCfg.ObsQueue).Result()
 			if err != nil {
 				if err == redis.Nil {
 					break
 				}
-				fmt.Fprintf(os.Stderr, "ERROR: RPOPLPUSH restore: %v\n", err)
-				os.Exit(1)
+				return fmt.Errorf("rpoplpush restore: %w", err)
 			}
 			if x == "" {
 				// Not expected from Redis, but keep safe.
 			}
 			moved++
 		}
-		fmt.Printf("[RESTORE] moved_back=%d from %s -> %s\n", moved, hq, *obsQueue)
+		fmt.Printf("[RESTORE] moved_back=%d from %s -> %s\n", moved, hq, measureCfg.ObsQueue)
 	}
+	return nil
 }

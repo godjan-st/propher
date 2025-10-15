@@ -4,77 +4,53 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"os"
 	"propher/internal"
+	"propher/internal/config"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
-func main() {
-	var (
-		inDump     = flag.String("in-dump", "", "Input dump file (JSONL) (required)")
-		outDump    = flag.String("out-dump", "", "Output dump file (JSONL) (required)")
-		sentField  = flag.String("sent-field", "sent_epoch", "Field to rewrite (default sent_epoch)")
-		epochUnit  = flag.String("epoch-unit", "ms", "Unit to write: ms or s (default ms)")
-		mode       = flag.String("mode", "increment", "Rewrite mode: same or increment (default increment)")
-		step       = flag.Int64("step", 1, "Step for increment mode (in ms or s depending on epoch-unit)")
-		baseEpoch  = flag.Int64("base-epoch", 0, "Base epoch override (0 = now)")
-		redisAddr  = flag.String("redis-addr", "127.0.0.1:6379", "If set, also load into Redis (host:port)")
-		redisPass  = flag.String("redis-pass", "", "Redis password")
-		redisDB    = flag.Int("redis-db", 0, "Redis DB")
-		redisQueue = flag.String("redis-queue", "", "Target Redis LIST key to load into")
-		redisPush  = flag.String("redis-push", "rpush", "rpush or lpush (default rpush)")
-		clearQueue = flag.Bool("clear-queue", false, "DEL target queue before loading")
-		batchSize  = flag.Int("batch", 1000, "Pipeline batch size (default 1000)")
-	)
-	flag.Parse()
-
-	if *inDump == "" || *outDump == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: --in-dump and --out-dump are required")
-		os.Exit(2)
+func RunLoadDumpAndRewrite(cfg *config.Config) error {
+	// Основная логика переписывания дампа и загрузки в Redis (опционально).
+	loadCfg := cfg.LoadDump
+	if loadCfg.InDump == "" || loadCfg.OutDump == "" {
+		return fmt.Errorf("in-dump and out-dump are required")
 	}
-	if *epochUnit != "ms" && *epochUnit != "s" {
-		fmt.Fprintln(os.Stderr, "ERROR: --epoch-unit must be ms or s")
-		os.Exit(2)
+	if loadCfg.EpochUnit != "ms" && loadCfg.EpochUnit != "s" {
+		return fmt.Errorf("epoch-unit must be ms or s")
 	}
-	if *mode != "same" && *mode != "increment" {
-		fmt.Fprintln(os.Stderr, "ERROR: --mode must be same or increment")
-		os.Exit(2)
+	if loadCfg.Mode != "same" && loadCfg.Mode != "increment" {
+		return fmt.Errorf("mode must be same or increment")
 	}
-	if *redisAddr != "" && *redisQueue == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: --redis-queue is required when --redis-addr is set")
-		os.Exit(2)
-	}
-	if *redisPush != "rpush" && *redisPush != "lpush" {
-		fmt.Fprintln(os.Stderr, "ERROR: --redis-push must be rpush or lpush")
-		os.Exit(2)
+	if loadCfg.RedisQueue != "" && loadCfg.RedisPush != "rpush" && loadCfg.RedisPush != "lpush" {
+		return fmt.Errorf("redis-push must be rpush or lpush")
 	}
 
-	base := *baseEpoch
+	base := loadCfg.BaseEpoch
 	if base == 0 {
-		if *epochUnit == "ms" {
+		if loadCfg.EpochUnit == "ms" {
 			base = internal.NowMS()
 		} else {
 			base = time.Now().Unix()
 		}
 	}
 
-	inF, err := os.Open(*inDump)
+	inF, err := os.Open(loadCfg.InDump)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: open in dump: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("open in dump: %w", err)
 	}
 	defer inF.Close()
 
-	outF, err := os.Create(*outDump)
+	outF, err := os.Create(loadCfg.OutDump)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: create out dump: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("create out dump: %w", err)
 	}
 	defer outF.Close()
 
+	// Сканы входных строк и буфер вывода.
 	inScan := bufio.NewScanner(inF)
 	// Allow big lines (messages) up to 32MB.
 	buf := make([]byte, 0, 1024*1024)
@@ -94,45 +70,48 @@ func main() {
 	var pipe redis.Pipeliner
 	ctx := context.Background()
 
-	if *redisAddr != "" {
-		rdb = redis.NewClient(&redis.Options{Addr: *redisAddr, Password: *redisPass, DB: *redisDB})
-		if *clearQueue {
-			if err := rdb.Del(ctx, *redisQueue).Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "ERROR: DEL queue: %v\n", err)
-				os.Exit(1)
+	// Подключение к Redis при наличии очереди.
+	if loadCfg.RedisQueue != "" {
+		rdb = redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Pass, DB: cfg.Redis.DB})
+		if loadCfg.ClearQueue {
+			if err := rdb.Del(ctx, loadCfg.RedisQueue).Err(); err != nil {
+				return fmt.Errorf("del queue: %w", err)
 			}
-			fmt.Printf("[REDIS] DEL %s\n", *redisQueue)
+			fmt.Printf("[REDIS] DEL %s\n", loadCfg.RedisQueue)
 		}
 		pipe = rdb.Pipeline()
 	}
 
-	flushPipe := func() {
+	flushPipe := func() error {
+		// Сбрасываем пайплайн при достижении батча.
 		if pipe == nil {
-			return
+			return nil
 		}
 		if _, err := pipe.Exec(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: redis pipeline exec: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("redis pipeline exec: %w", err)
 		}
+		return nil
 	}
 
 	enq := func(b []byte) {
+		// Добавляем сообщение в очередь Redis.
 		if pipe == nil {
 			return
 		}
-		if *redisPush == "rpush" {
-			pipe.RPush(ctx, *redisQueue, b)
+		if loadCfg.RedisPush == "rpush" {
+			pipe.RPush(ctx, loadCfg.RedisQueue, b)
 		} else {
-			pipe.LPush(ctx, *redisQueue, b)
+			pipe.LPush(ctx, loadCfg.RedisQueue, b)
 		}
 	}
 
-	batch := *batchSize
+	batch := loadCfg.BatchSize
 	if batch <= 0 {
 		batch = 1000
 	}
 	pending := 0
 
+	// Основной проход по строкам дампа.
 	for inScan.Scan() {
 		nIn++
 		line := inScan.Bytes()
@@ -149,13 +128,13 @@ func main() {
 		}
 
 		var v int64
-		if *mode == "same" {
+		if loadCfg.Mode == "same" {
 			v = base
 		} else {
 			v = cur
-			cur += *step
+			cur += loadCfg.Step
 		}
-		obj[*sentField] = v
+		obj[loadCfg.SentField] = v
 
 		outBytes, err := json.Marshal(obj)
 		if err != nil {
@@ -164,49 +143,54 @@ func main() {
 		}
 
 		if _, err := outW.Write(outBytes); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: write out dump: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("write out dump: %w", err)
 		}
 		if err := outW.WriteByte('\n'); err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: write newline: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("write newline: %w", err)
 		}
 		nOut++
 
+		// Пакетная отправка в Redis.
 		if pipe != nil {
 			enq(outBytes)
 			pending++
 			if pending >= batch {
-				flushPipe()
+				if err := flushPipe(); err != nil {
+					return err
+				}
 				pending = 0
 				fmt.Printf("[REDIS] pushed=%d\n", nOut)
 			}
 		}
 	}
 	if err := inScan.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: scan input: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("scan input: %w", err)
 	}
 
+	// Досылаем оставшийся пайплайн.
 	if pipe != nil && pending > 0 {
-		flushPipe()
+		if err := flushPipe(); err != nil {
+			return err
+		}
 	}
 
 	fmt.Printf("[DUMP] in_lines=%d out_lines=%d bad_lines_skipped=%d base=%d unit=%s mode=%s\n",
-		nIn, nOut, nBad, base, *epochUnit, *mode)
+		nIn, nOut, nBad, base, loadCfg.EpochUnit, loadCfg.Mode)
 
+	// Проверка длины очереди, если Redis был задействован.
 	if rdb != nil {
-		llen, err := rdb.LLen(ctx, *redisQueue).Result()
+		llen, err := rdb.LLen(ctx, loadCfg.RedisQueue).Result()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: LLEN: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("llen: %w", err)
 		}
-		fmt.Printf("[REDIS] done queue=%s llen=%d\n", *redisQueue, llen)
+		fmt.Printf("[REDIS] done queue=%s llen=%d\n", loadCfg.RedisQueue, llen)
 	}
+	return nil
 }
 
 // Minimal trim to avoid pulling bytes package just for this.
 func bytesTrimSpace(b []byte) []byte {
+	// Обрезаем пробелы по краям без дополнительных зависимостей.
 	left := 0
 	right := len(b) - 1
 	for left <= right {
