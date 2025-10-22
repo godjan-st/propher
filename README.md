@@ -1,5 +1,9 @@
 # Propher
 
+Do you want measurement utility for your **high-load**, **stream-based** services?  
+You don't want or don't have resources yet to deploy heavy-duty production monitoring tools?<br/>
+**Propher** is **simple**, **lightweight**, **efficient** and rapid to deploy one-shot instrument for your **development environment**! 
+
 `Propher` is a replay-and-profile CLI for stream workloads. It rewrites timestamps in JSONL dumps, pushes messages to Redis or MQTT, then profiles end-to-end latency from result queues.
 
 ## What It Solves
