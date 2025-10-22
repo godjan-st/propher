@@ -38,6 +38,16 @@ func realMain() int {
 
 	// Диспатчим подкоманды.
 	switch mode {
+	case modeRun:
+		if err := app.RunLoadDumpAndRewrite(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		if err := app.RunMeasureListLatency(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		return 0
 	case modeLoadDumpAndRewrite:
 		if err := app.RunLoadDumpAndRewrite(cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -101,6 +111,9 @@ func parseConfig(args []string) (*config.Config, string, error) {
 
 	// Режимные флаги подключаем по выбранному режиму.
 	switch mode {
+	case modeRun:
+		bindLoadDumpFlags(fs, &cfg.LoadDump)
+		bindMeasureListLatencyFlags(fs, &cfg.MeasureListLatency)
 	case modeLoadDumpAndRewrite:
 		bindLoadDumpFlags(fs, &cfg.LoadDump)
 	case modeMeasureListLatency:
@@ -126,11 +139,15 @@ func bindCommonFlags(fs *flag.FlagSet, cfg *config.Config) {
 	// Общие параметры CLI.
 	fs.BoolVar(&cfg.Debug, "debug", cfg.Debug, "Enable debug logging")
 	fs.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Timeout duration (e.g. 5s, 1m)")
-	fs.StringVar(&cfg.QueueName, "queue", cfg.QueueName, "Queue name")
+	//fs.StringVar(&cfg.QueueName, "queue", cfg.QueueName, "Queue name")
 	fs.StringVar(&cfg.Redis.URL, "redis-url", cfg.Redis.URL, "Redis URL")
 	fs.StringVar(&cfg.Redis.Addr, "redis-addr", cfg.Redis.Addr, "Redis address")
 	fs.StringVar(&cfg.Redis.Pass, "redis-pass", cfg.Redis.Pass, "Redis password")
 	fs.IntVar(&cfg.Redis.DB, "redis-db", cfg.Redis.DB, "Redis database number")
+	fs.StringVar(&cfg.MQTT.Broker, "mqtt-broker", cfg.MQTT.Broker, "MQTT broker URL (e.g. tcp://127.0.0.1:1883)")
+	fs.StringVar(&cfg.MQTT.Username, "mqtt-username", cfg.MQTT.Username, "MQTT username")
+	fs.StringVar(&cfg.MQTT.Password, "mqtt-password", cfg.MQTT.Password, "MQTT password")
+	fs.StringVar(&cfg.MQTT.ClientID, "mqtt-client-id", cfg.MQTT.ClientID, "MQTT client id")
 }
 
 func bindLoadDumpFlags(fs *flag.FlagSet, cfg *config.LoadDumpConfig) {
@@ -146,6 +163,9 @@ func bindLoadDumpFlags(fs *flag.FlagSet, cfg *config.LoadDumpConfig) {
 	fs.StringVar(&cfg.RedisPush, "redis-push", cfg.RedisPush, "rpush or lpush")
 	fs.BoolVar(&cfg.ClearQueue, "clear-queue", cfg.ClearQueue, "DEL target queue before loading")
 	fs.IntVar(&cfg.BatchSize, "batch", cfg.BatchSize, "Pipeline batch size")
+	fs.StringVar(&cfg.MQTTTopic, "mqtt-topic", cfg.MQTTTopic, "Target MQTT topic to publish into")
+	fs.IntVar(&cfg.MQTTQoS, "mqtt-qos", cfg.MQTTQoS, "MQTT QoS (0..2)")
+	fs.BoolVar(&cfg.MQTTRetain, "mqtt-retain", cfg.MQTTRetain, "MQTT retain flag")
 }
 
 func bindMeasureListLatencyFlags(fs *flag.FlagSet, cfg *config.MeasureListLatencyConfig) {
@@ -154,11 +174,13 @@ func bindMeasureListLatencyFlags(fs *flag.FlagSet, cfg *config.MeasureListLatenc
 	fs.StringVar(&cfg.HoldQueue, "hold-queue", cfg.HoldQueue, "Hold LIST key (default: <obs-queue>:hold)")
 	fs.IntVar(&cfg.DurationSec, "duration-sec", cfg.DurationSec, "How long to measure (seconds)")
 	fs.IntVar(&cfg.BlockSec, "block-sec", cfg.BlockSec, "BRPOPLPUSH timeout (seconds)")
-	fs.IntVar(&cfg.MaxMessages, "max-messages", cfg.MaxMessages, "Stop after N messages (0 = unlimited)")
 	fs.StringVar(&cfg.OutJSONL, "out-jsonl", cfg.OutJSONL, "Output JSONL path")
-	fs.StringVar(&cfg.T0Field, "t0-field", cfg.T0Field, "Field containing t0")
-	fs.StringVar(&cfg.T0Unit, "t0-unit", cfg.T0Unit, "Unit for t0: ms or s")
-	fs.StringVar(&cfg.TraceField, "trace-field", cfg.TraceField, "Field containing trace id")
+	fs.StringVar(&cfg.SourceDump, "source-dump", cfg.SourceDump, "Source dump file (JSONL) to match by message_id (required)")
+	fs.StringVar(&cfg.MessageIDField, "message-id-field", cfg.MessageIDField, "Field containing message id")
+	fs.StringVar(&cfg.SourceSentField, "source-sent-field", cfg.SourceSentField, "Field containing source sent_epoch")
+	fs.StringVar(&cfg.SourceSentUnit, "source-sent-unit", cfg.SourceSentUnit, "Unit for source sent_epoch: auto, s, ms, us")
+	fs.StringVar(&cfg.T0Field, "t0-field", cfg.T0Field, "Field containing result sent_epoch")
+	fs.StringVar(&cfg.T0Unit, "t0-unit", cfg.T0Unit, "Unit for result sent_epoch: auto, s, ms, us")
 	fs.BoolVar(&cfg.Restore, "restore", cfg.Restore, "Restore messages from hold back to obs after measurement")
 	fs.BoolVar(&cfg.RestoreVerify, "restore-verify-empty", cfg.RestoreVerify, "Refuse restore if obs-queue is non-empty at restore time")
 }

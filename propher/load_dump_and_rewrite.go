@@ -8,13 +8,41 @@ import (
 	"os"
 	"propher/internal"
 	"propher/internal/config"
+	"strings"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/redis/go-redis/v9"
 )
 
 func RunLoadDumpAndRewrite(cfg *config.Config) error {
-	// Основная логика переписывания дампа и загрузки в Redis (опционально).
+	// Входная точка для режима load-dump-and-rewrite.
+	return runLoadDumpAndRewrite(context.Background(), cfg, newQueueWriter)
+}
+
+// queueWriterFactory описывает DI-фабрику для очередей.
+type queueWriterFactory func(ctx context.Context, cfg *config.Config) (queueWriter, error)
+
+// queueWriter описывает минимальный интерфейс очереди.
+type queueWriter interface {
+	// Enqueue добавляет сообщение в очередь.
+	Enqueue(ctx context.Context, payload []byte) error
+	// Flush сбрасывает отложенные сообщения.
+	Flush(ctx context.Context) error
+	// Close освобождает ресурсы.
+	Close(ctx context.Context) error
+	// Label возвращает имя транспорта для логов.
+	Label() string
+}
+
+type queueReporter interface {
+	// Report возвращает финальную строку отчета.
+	Report(ctx context.Context) (string, error)
+}
+
+// runLoadDumpAndRewrite выполняет переписывание дампа с DI для очередей.
+func runLoadDumpAndRewrite(ctx context.Context, cfg *config.Config, factory queueWriterFactory) error {
+	// Основная логика переписывания дампа и загрузки в очередь (опционально).
 	loadCfg := cfg.LoadDump
 	if loadCfg.InDump == "" || loadCfg.OutDump == "" {
 		return fmt.Errorf("in-dump and out-dump are required")
@@ -27,6 +55,12 @@ func RunLoadDumpAndRewrite(cfg *config.Config) error {
 	}
 	if loadCfg.RedisQueue != "" && loadCfg.RedisPush != "rpush" && loadCfg.RedisPush != "lpush" {
 		return fmt.Errorf("redis-push must be rpush or lpush")
+	}
+	if loadCfg.MQTTTopic != "" && (loadCfg.MQTTQoS < 0 || loadCfg.MQTTQoS > 2) {
+		return fmt.Errorf("mqtt-qos must be 0, 1, or 2")
+	}
+	if loadCfg.RedisQueue != "" && loadCfg.MQTTTopic != "" {
+		return fmt.Errorf("redis-queue and mqtt-topic are mutually exclusive")
 	}
 
 	base := loadCfg.BaseEpoch
@@ -66,43 +100,12 @@ func RunLoadDumpAndRewrite(cfg *config.Config) error {
 		cur  = base
 	)
 
-	var rdb *redis.Client
-	var pipe redis.Pipeliner
-	ctx := context.Background()
-
-	// Подключение к Redis при наличии очереди.
-	if loadCfg.RedisQueue != "" {
-		rdb = redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Pass, DB: cfg.Redis.DB})
-		if loadCfg.ClearQueue {
-			if err := rdb.Del(ctx, loadCfg.RedisQueue).Err(); err != nil {
-				return fmt.Errorf("del queue: %w", err)
-			}
-			fmt.Printf("[REDIS] DEL %s\n", loadCfg.RedisQueue)
-		}
-		pipe = rdb.Pipeline()
+	writer, err := factory(ctx, cfg)
+	if err != nil {
+		return err
 	}
-
-	flushPipe := func() error {
-		// Сбрасываем пайплайн при достижении батча.
-		if pipe == nil {
-			return nil
-		}
-		if _, err := pipe.Exec(ctx); err != nil {
-			return fmt.Errorf("redis pipeline exec: %w", err)
-		}
-		return nil
-	}
-
-	enq := func(b []byte) {
-		// Добавляем сообщение в очередь Redis.
-		if pipe == nil {
-			return
-		}
-		if loadCfg.RedisPush == "rpush" {
-			pipe.RPush(ctx, loadCfg.RedisQueue, b)
-		} else {
-			pipe.LPush(ctx, loadCfg.RedisQueue, b)
-		}
+	if writer != nil {
+		defer writer.Close(ctx)
 	}
 
 	batch := loadCfg.BatchSize
@@ -151,15 +154,17 @@ func RunLoadDumpAndRewrite(cfg *config.Config) error {
 		nOut++
 
 		// Пакетная отправка в Redis.
-		if pipe != nil {
-			enq(outBytes)
+		if writer != nil {
+			if err := writer.Enqueue(ctx, outBytes); err != nil {
+				return err
+			}
 			pending++
 			if pending >= batch {
-				if err := flushPipe(); err != nil {
+				if err := writer.Flush(ctx); err != nil {
 					return err
 				}
 				pending = 0
-				fmt.Printf("[REDIS] pushed=%d\n", nOut)
+				fmt.Printf("[%s] pushed=%d\n", strings.ToUpper(writer.Label()), nOut)
 			}
 		}
 	}
@@ -168,8 +173,8 @@ func RunLoadDumpAndRewrite(cfg *config.Config) error {
 	}
 
 	// Досылаем оставшийся пайплайн.
-	if pipe != nil && pending > 0 {
-		if err := flushPipe(); err != nil {
+	if writer != nil && pending > 0 {
+		if err := writer.Flush(ctx); err != nil {
 			return err
 		}
 	}
@@ -177,15 +182,193 @@ func RunLoadDumpAndRewrite(cfg *config.Config) error {
 	fmt.Printf("[DUMP] in_lines=%d out_lines=%d bad_lines_skipped=%d base=%d unit=%s mode=%s\n",
 		nIn, nOut, nBad, base, loadCfg.EpochUnit, loadCfg.Mode)
 
-	// Проверка длины очереди, если Redis был задействован.
-	if rdb != nil {
-		llen, err := rdb.LLen(ctx, loadCfg.RedisQueue).Result()
+	// Проверка состояния очереди, если доступна отчетность.
+	if reporter, ok := writer.(queueReporter); ok {
+		report, err := reporter.Report(ctx)
 		if err != nil {
-			return fmt.Errorf("llen: %w", err)
+			return err
 		}
-		fmt.Printf("[REDIS] done queue=%s llen=%d\n", loadCfg.RedisQueue, llen)
+		if report != "" {
+			fmt.Println(report)
+		}
 	}
 	return nil
+}
+
+type redisQueueWriter struct {
+	// Клиент Redis и пайплайн.
+	client *redis.Client
+	pipe   redis.Pipeliner
+	queue  string
+	push   string
+}
+
+// newRedisQueueWriter создает Redis-обертку для очереди.
+func newRedisQueueWriter(ctx context.Context, cfg *config.Config) (*redisQueueWriter, error) {
+	opts, err := redisOptions(cfg.Redis)
+	if err != nil {
+		return nil, err
+	}
+	client := redis.NewClient(opts)
+	if cfg.LoadDump.ClearQueue {
+		if err := client.Del(ctx, cfg.LoadDump.RedisQueue).Err(); err != nil {
+			return nil, fmt.Errorf("del queue: %w", err)
+		}
+		fmt.Printf("[REDIS] DEL %s\n", cfg.LoadDump.RedisQueue)
+	}
+	return &redisQueueWriter{
+		client: client,
+		pipe:   client.Pipeline(),
+		queue:  cfg.LoadDump.RedisQueue,
+		push:   cfg.LoadDump.RedisPush,
+	}, nil
+}
+
+// Enqueue добавляет сообщение в Redis LIST.
+func (r *redisQueueWriter) Enqueue(ctx context.Context, payload []byte) error {
+	// Добавляем сообщение в очередь Redis.
+	if r.push == "rpush" {
+		r.pipe.RPush(ctx, r.queue, payload)
+	} else {
+		r.pipe.LPush(ctx, r.queue, payload)
+	}
+	return nil
+}
+
+// Flush выполняет Exec пайплайна Redis.
+func (r *redisQueueWriter) Flush(ctx context.Context) error {
+	// Сбрасываем пайплайн при достижении батча.
+	if _, err := r.pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("redis pipeline exec: %w", err)
+	}
+	return nil
+}
+
+// Close закрывает Redis-клиент.
+func (r *redisQueueWriter) Close(ctx context.Context) error {
+	// Освобождаем ресурсы Redis.
+	_ = ctx
+	return r.client.Close()
+}
+
+// Label возвращает метку логов.
+func (r *redisQueueWriter) Label() string {
+	// Используем Redis как метку.
+	return "redis"
+}
+
+// Report возвращает строку с длиной очереди.
+func (r *redisQueueWriter) Report(ctx context.Context) (string, error) {
+	// Формируем отчет по длине очереди.
+	llen, err := r.client.LLen(ctx, r.queue).Result()
+	if err != nil {
+		return "", fmt.Errorf("llen: %w", err)
+	}
+	return fmt.Sprintf("[REDIS] done queue=%s llen=%d", r.queue, llen), nil
+}
+
+type mqttQueueWriter struct {
+	// Клиент MQTT и параметры публикации.
+	client  mqtt.Client
+	topic   string
+	qos     byte
+	retain  bool
+	timeout time.Duration
+}
+
+// newMQTTQueueWriter создает MQTT-обертку для очереди.
+func newMQTTQueueWriter(cfg *config.Config) (*mqttQueueWriter, error) {
+	if cfg.MQTT.Broker == "" {
+		return nil, fmt.Errorf("mqtt-broker is required when mqtt-topic is set")
+	}
+	opts := mqtt.NewClientOptions().AddBroker(cfg.MQTT.Broker)
+	if cfg.MQTT.ClientID != "" {
+		opts.SetClientID(cfg.MQTT.ClientID)
+	}
+	if cfg.MQTT.Username != "" {
+		opts.SetUsername(cfg.MQTT.Username)
+		opts.SetPassword(cfg.MQTT.Password)
+	}
+	client := mqtt.NewClient(opts)
+	token := client.Connect()
+	if !token.WaitTimeout(cfg.Timeout) {
+		return nil, fmt.Errorf("mqtt connect timeout")
+	}
+	if err := token.Error(); err != nil {
+		return nil, fmt.Errorf("mqtt connect: %w", err)
+	}
+	return &mqttQueueWriter{
+		client:  client,
+		topic:   cfg.LoadDump.MQTTTopic,
+		qos:     byte(cfg.LoadDump.MQTTQoS),
+		retain:  cfg.LoadDump.MQTTRetain,
+		timeout: cfg.Timeout,
+	}, nil
+}
+
+// Enqueue публикует сообщение в MQTT.
+func (m *mqttQueueWriter) Enqueue(ctx context.Context, payload []byte) error {
+	// Публикуем сообщение в MQTT.
+	_ = ctx
+	token := m.client.Publish(m.topic, m.qos, m.retain, payload)
+	if !token.WaitTimeout(m.timeout) {
+		return fmt.Errorf("mqtt publish timeout")
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("mqtt publish: %w", err)
+	}
+	return nil
+}
+
+// Flush для MQTT не требуется, поэтому это no-op.
+func (m *mqttQueueWriter) Flush(ctx context.Context) error {
+	// Ничего не делаем для MQTT.
+	_ = ctx
+	return nil
+}
+
+// Close закрывает MQTT-соединение.
+func (m *mqttQueueWriter) Close(ctx context.Context) error {
+	// Закрываем соединение MQTT.
+	_ = ctx
+	m.client.Disconnect(250)
+	return nil
+}
+
+// Label возвращает метку логов.
+func (m *mqttQueueWriter) Label() string {
+	// Используем MQTT как метку.
+	return "mqtt"
+}
+
+// newQueueWriter выбирает реализацию очереди по конфигурации.
+func newQueueWriter(ctx context.Context, cfg *config.Config) (queueWriter, error) {
+	// Возвращаем подходящий транспорт очереди.
+	switch {
+	case cfg.LoadDump.RedisQueue != "":
+		return newRedisQueueWriter(ctx, cfg)
+	case cfg.LoadDump.MQTTTopic != "":
+		return newMQTTQueueWriter(cfg)
+	default:
+		return nil, nil
+	}
+}
+
+// redisOptions готовит redis.Options с учетом URL.
+func redisOptions(cfg config.RedisConfig) (*redis.Options, error) {
+	// Предпочитаем URL, если он задан.
+	if cfg.URL != "" {
+		opts, err := redis.ParseURL(cfg.URL)
+		if err != nil {
+			return nil, fmt.Errorf("redis parse url: %w", err)
+		}
+		return opts, nil
+	}
+	return &redis.Options{
+		Addr:     cfg.Addr,
+		Password: cfg.Pass,
+		DB:       cfg.DB,
+	}, nil
 }
 
 // Minimal trim to avoid pulling bytes package just for this.

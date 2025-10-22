@@ -20,15 +20,28 @@ type RedisConfig struct {
 	URL string // optional, preferred if set
 }
 
+type MQTTConfig struct {
+	// Broker - адрес MQTT брокера (например, tcp://127.0.0.1:1883).
+	Broker string
+	// Username - имя пользователя MQTT.
+	Username string
+	// Password - пароль MQTT.
+	Password string
+	// ClientID - идентификатор клиента MQTT.
+	ClientID string
+}
+
 type Config struct {
 	// Debug включает отладочный режим.
 	Debug bool
 	// Timeout - таймаут запросов.
 	Timeout time.Duration
 	// QueueName - имя очереди по умолчанию.
-	QueueName string
+	//QueueName string
 	// Redis - параметры подключения к Redis.
 	Redis RedisConfig
+	// MQTT - параметры подключения к MQTT.
+	MQTT MQTTConfig
 	// LoadDump - настройки режима load-dump-and-rewrite.
 	LoadDump LoadDumpConfig
 	// MeasureListLatency - настройки режима measure-list-latency.
@@ -58,6 +71,12 @@ type LoadDumpConfig struct {
 	ClearQueue bool
 	// BatchSize - размер батча пайплайна.
 	BatchSize int
+	// MQTTTopic - топик MQTT для загрузки.
+	MQTTTopic string
+	// MQTTQoS - QoS для MQTT (0..2).
+	MQTTQoS int
+	// MQTTRetain - retain флаг MQTT.
+	MQTTRetain bool
 }
 
 type MeasureListLatencyConfig struct {
@@ -69,13 +88,19 @@ type MeasureListLatencyConfig struct {
 	DurationSec int
 	// BlockSec - таймаут BRPOPLPUSH в секундах.
 	BlockSec int
-	// MaxMessages - ограничение на число сообщений.
-	MaxMessages int
 	// OutJSONL - путь к JSONL-отчету.
 	OutJSONL string
-	// T0Field - поле с исходным временем.
+	// SourceDump - путь к исходному JSONL дампу для сопоставления.
+	SourceDump string
+	// MessageIDField - поле с message_id.
+	MessageIDField string
+	// SourceSentField - поле sent_epoch в источнике.
+	SourceSentField string
+	// SourceSentUnit - единица времени источника: auto, s, ms, us.
+	SourceSentUnit string
+	// T0Field - поле sent_epoch в результирующем сообщении.
 	T0Field string
-	// T0Unit - единица времени: ms или s.
+	// T0Unit - единица времени: auto, s, ms, us.
 	T0Unit string
 	// TraceField - поле trace id.
 	TraceField string
@@ -95,6 +120,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	mqttCfg, err := loadMQTTConfig()
+	if err != nil {
+		return nil, err
+	}
 
 	timeout, err := getenvDuration("TIMEOUT", 5*time.Second)
 	if err != nil {
@@ -103,10 +132,11 @@ func Load() (*Config, error) {
 
 	// Собираем конфигурацию со значениями по умолчанию.
 	return &Config{
-		Debug:     getenvBool("DEBUG", false),
-		Timeout:   timeout,
-		QueueName: getenvDefault("QUEUE_NAME", "default"),
-		Redis:     redis,
+		Debug:   getenvBool("DEBUG", false),
+		Timeout: timeout,
+		//QueueName: getenvDefault("QUEUE_NAME", "default"),
+		Redis: redis,
+		MQTT:  mqttCfg,
 		LoadDump: LoadDumpConfig{
 			SentField: "sent_epoch",
 			EpochUnit: "ms",
@@ -114,14 +144,18 @@ func Load() (*Config, error) {
 			Step:      1,
 			RedisPush: "rpush",
 			BatchSize: 1000,
+			MQTTQoS:   0,
 		},
 		MeasureListLatency: MeasureListLatencyConfig{
-			DurationSec: 600,
-			BlockSec:    1,
-			OutJSONL:    "latency.jsonl",
-			T0Field:     "sent_epoch",
-			T0Unit:      "ms",
-			TraceField:  "trace_id",
+			DurationSec:     600,
+			BlockSec:        1,
+			OutJSONL:        "latency.jsonl",
+			MessageIDField:  "message_id",
+			SourceSentField: "sent_epoch",
+			SourceSentUnit:  "auto",
+			T0Field:         "sent_epoch",
+			T0Unit:          "us",
+			TraceField:      "trace_id",
 		},
 	}, nil
 }
@@ -155,6 +189,16 @@ func loadRedisConfig() (RedisConfig, error) {
 		Addr: addr,
 		Pass: pass,
 		DB:   db,
+	}, nil
+}
+
+func loadMQTTConfig() (MQTTConfig, error) {
+	// Считываем параметры MQTT из окружения.
+	return MQTTConfig{
+		Broker:   os.Getenv("MQTT_BROKER"),
+		Username: os.Getenv("MQTT_USERNAME"),
+		Password: os.Getenv("MQTT_PASSWORD"),
+		ClientID: os.Getenv("MQTT_CLIENT_ID"),
 	}, nil
 }
 
